@@ -23,7 +23,7 @@ CREATE TABLE car_market  (
     color VARCHAR(25) NOT NULL,
     fuel ENUM('gasoline','flex','diesel','electric','hybrid') NOT NULL,
     mileage INT UNSIGNED NOT NULL,
-    dollar_price decimal(14,2) NOT NULL, -- first the test required response attributes (not null)
+    dollar_price decimal(9,2) NOT NULL, -- first the test required response attributes (not null)
     is_automatic BOOL,
     has_air_conditioning BOOL,
     has_charger_plug BOOL,
