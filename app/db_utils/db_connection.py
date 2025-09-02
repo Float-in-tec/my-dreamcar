@@ -22,7 +22,7 @@ class DBConn:
             "main": {
                 "driver": os.getenv("DB_DRIVER", "mysql+pymysql"),
                 "user": os.getenv("DB_USER", "car_user"),
-                "pwd": os.getenv("DB_PASSWORD", "car_pass"), #hardcoded password and credentials just for the challenge. In real-case scenario use ENV VAR
+                "pwd": os.getenv("DB_PASS", "car_pass"), #hardcoded password and credentials just for the challenge. In real-case scenario use ENV VAR
                 "addr": os.getenv("DB_HOST", "db"),
                 "port": os.getenv("DB_PORT", "3306"),
                 "db_name": os.getenv("DB_NAME", "cars"),
@@ -47,6 +47,8 @@ class DBConn:
             pool_size=s["pool_size"],
             max_overflow=s["max_overflow"],
             pool_recycle=s["pool_recycle"],
+            pool_pre_ping=True,
+            connect_args={"connect_timeout": 10},
         )
         SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
         self.session = SessionLocal()
