@@ -1,5 +1,6 @@
 import random
 import time
+import traceback
 from app.dao.car_market import DAOCar
 from app.db_utils.db_connection import DBConn
 from app.services.makers_and_models import MAKERS_AND_MODELS
@@ -16,6 +17,7 @@ class DBSeeder:
         self.seed_count = seed_count
 
     def run(self):
+        time.sleep(12)
         for i in range(6): # had too many issues in auto-start seeder
             try:
                 self.create_db_conn()
@@ -25,6 +27,7 @@ class DBSeeder:
                 break
             except Exception as e:
                 print(f'failed seed script. debug and try again. {e}')
+                traceback.print_exc()
             finally:
                 self.db_conn.disconnect()
 
@@ -40,7 +43,7 @@ class DBSeeder:
             dao = DAOCar()
             dao.make = make
             dao.model = random.choice(MAKERS_AND_MODELS[make])
-            dao.year = random.randint(1980, 2025)
+            dao.year = year
             dao.color = random.choice(COLORS)
             dao.fuel = random.choice(FUEL_ENUM)
             dao.mileage = self.mileage_considering_year(year)
