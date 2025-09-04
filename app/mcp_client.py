@@ -1,131 +1,111 @@
-# app/mcp_client.py
-# Cliente MCP mínimo (STDIO), sem LLM.
+"""
+# Minimal. Adapting base class to be able to apply in our case.
+# Author: Yara
+# Created On: Sep 20205
+"""
+from __future__ import annotations
+import argparse, asyncio, json
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from app.vendor.mcp_client_base import Server
 
-import asyncio
-import json
-import argparse
-from typing import Any, Dict
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+CONFIG_PATH = Path(__file__).resolve().parent / "vendor" / "servers_config.json"
 
-def parse_args():
-    p = argparse.ArgumentParser(description="MCP client for search_cars")
+class CarClient:
+    """
+    Start Server via STDIO using config JSON.
+    Expses search_cars(**filters) e normalizes returno to List[dict].
+    """
+    def __init__(self, server_name: str = "python", config_path: Path = CONFIG_PATH) -> None:
+        with open(config_path, "r", encoding="utf-8") as f:
+            all_cfg = json.load(f)
+        try:
+            cfg = all_cfg["mcpServers"][server_name]
+        except Exception as e:
+            raise RuntimeError(f"Config inválida em {config_path}: {e}")
+        self.server = Server(server_name, cfg)  # <- classe do vendor
+
+    async def initialize(self) -> None:
+        await self.server.initialize()
+
+    async def close(self) -> None:
+        await self.server.cleanup()
+
+    async def list_tools(self) -> List[str]:
+        tools = await self.server.list_tools()
+        names = []
+        for t in tools:
+            name = getattr(t, "name", None) or (isinstance(t, dict) and t.get("name"))
+            if name: names.append(str(name))
+        return names
+
+    async def search_cars(self, **filters: Any) -> List[Dict[str, Any]]:
+        tools = await self.list_tools()
+        if "search_cars" not in tools:
+            raise RuntimeError("Failed to find 'search_cars' tools.")
+        result = await self.server.execute_tool("search_cars", filters)
+        return self._normalize_rows(result)
+
+    def _normalize_rows(self, result: Any) -> List[Dict[str, Any]]:
+        """
+        Normalizes return as List[dict].
+        """
+        plain = getattr(result, "model_dump", lambda: result)()
+        content = (plain or {}).get("content") if isinstance(plain, dict) else getattr(result, "content", None)
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "json" and isinstance(part.get("data"), list):
+                    return part["data"]
+                if isinstance(part, dict) and part.get("type") == "text":
+                    try:
+                        parsed = json.loads(part.get("text", ""))
+                        if isinstance(parsed, list):
+                            return parsed
+                    except Exception:
+                        pass
+
+        if isinstance(plain, dict) and isinstance(plain.get("result"), list):
+            return plain["result"]
+
+        if isinstance(plain, list):
+            return plain
+        return []
+
+# ---------------- CLI smoke test ----------------
+
+async def _cli() -> None:
+    p = argparse.ArgumentParser(description="MCP client (vendor Server) — smoke test")
     p.add_argument("--make")
     p.add_argument("--fuel", choices=["gasoline","flex","diesel","electric","hybrid"])
     p.add_argument("--year-min", type=int)
     p.add_argument("--year-max", type=int)
     p.add_argument("--price-min", type=int)
     p.add_argument("--price-max", type=int)
-    p.add_argument("--limit", type=int, default=20)
-    p.add_argument("--debug-raw", action="store_true", help="print raw tool result")
-    return p.parse_args()
+    p.add_argument("--limit", type=int, default=10)
+    a = p.parse_args()
 
-def _to_plain(obj: Any) -> Any:
-    for attr in ("model_dump", "dict"):
-        fn = getattr(obj, attr, None)
-        if callable(fn):
-            try:
-                return fn()
-            except Exception:
-                pass
-    return obj
+    filters = {k: v for k, v in {
+        "make": a.make, "fuel": a.fuel, "year_min": a.year_min, "year_max": a.year_max,
+        "price_min": a.price_min, "price_max": a.price_max, "limit": a.limit
+    }.items() if v is not None}
 
-def _extract_from_content_items(items: Any):
-    if items is None:
-        return None
-    norm = []
-    for it in items:
-        itp = _to_plain(it)
-        norm.append(itp)
-    for part in norm:
-        if isinstance(part, dict):
-            t = part.get("type")
-            if t == "json":
-                data = part.get("data")
-                if isinstance(data, list):
-                    return data
-                if isinstance(data, dict) and isinstance(data.get("items"), list):
-                    return data["items"]
-            if t == "text":
-                txt = part.get("text")
-                if isinstance(txt, str):
-                    try:
-                        parsed = json.loads(txt)
-                        if isinstance(parsed, list):
-                            return parsed
-                    except Exception:
-                        pass
-    return None
-
-def extract_cars_from_result(result: Any):
-    plain = _to_plain(result)
-    if isinstance(plain, dict) and "content" in plain:
-        cars = _extract_from_content_items(plain.get("content"))
-        if isinstance(cars, list):
-            return cars
-    content = getattr(result, "content", None)
-    if content is not None:
-        cars = _extract_from_content_items(content)
-        if isinstance(cars, list):
-            return cars
-    if isinstance(plain, list):
-        return plain
-    if isinstance(plain, str):
-        try:
-            parsed = json.loads(plain)
-            if isinstance(parsed, list):
-                return parsed
-        except Exception:
-            pass
-    return []
-
-async def call_search_cars(filters: Dict[str, Any], debug_raw: bool=False) -> Any:
-    params = StdioServerParameters(
-        command="python",
-        args=["-m", "app.mcp_server"],  # inicia o server via stdio
-    )
-    async with stdio_client(params) as (rx, tx):
-        async with ClientSession(rx, tx) as session:
-            await session.initialize()
-            # >>> Enviar no shape {"filters": {...}}
-            result = await session.call_tool("search_cars", filters)
-            if debug_raw:
-                try:
-                    print("[debug] raw result:", json.dumps(_to_plain(result), indent=2, ensure_ascii=False))
-                except Exception as e:
-                    print("[debug] raw result (repr):", repr(result), f"(dump error: {e})")
-            return result
-
-def main():
-    args = parse_args()
-    filters = {
-        "make": args.make,
-        "fuel": args.fuel,
-        "year_min": args.year_min,
-        "year_max": args.year_max,
-        "price_min": args.price_min,
-        "price_max": args.price_max,
-        "limit": args.limit,
-    }
-    filters = {k: v for k, v in filters.items() if v is not None}
-    print("[client] calling search_cars with:", filters)
-
-    result = asyncio.run(call_search_cars(filters, debug_raw=args.debug_raw))
-    cars = extract_cars_from_result(result)
-
-    if not cars:
-        print("Sem resultados.")
-        return
-
-    print("\nResultados:")
-    for i, car in enumerate(cars, 1):
-        if not isinstance(car, dict):
-            print(f"- {i}. {car}")
-            continue
-        print(
-            f"- {i}. {car.get('make')} {car.get('model')} {car.get('year')}, "
-            f"{car.get('color')}, {car.get('mileage')} km, US${car.get('dollar_price')}"
-        )
+    client = CarClient()
+    try:
+        await client.initialize()
+        rows = await client.search_cars(**filters)
+        if not rows:
+            print("No results")
+            return
+        for i, car in enumerate(rows, 1):
+            if not isinstance(car, dict):
+                print(f"- {i}. {car}")
+                continue
+            price = car.get("dollar_price")
+            price_fmt = f"US${int(price):,}".replace(",", ".") if isinstance(price, (int, float)) else price
+            print(f"- {i}. {car.get('make')} {car.get('model')} {car.get('year')}, "
+                  f"{car.get('color')}, {car.get('mileage')} km, {price_fmt}")
+    finally:
+        await client.close()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(_cli())

@@ -1,7 +1,20 @@
 """
-All file extracted(copy/pasted) from: https://github.com/modelcontextprotocol/python-sdk/blob/main/examples/clients/simple-chatbot/mcp_simple_chatbot/main.py
-This will be used as base for my mcp_client.
-MIT License
+# All file extracted(copy/pasted) from: https://github.com/modelcontextprotocol/python-sdk/blob/main/examples/clients/simple-chatbot/mcp_simple_chatbot/main.py
+# This will be used as base for my mcp_client.
+
+# Vendored from: Model Context Protocol Python SDK (examples / client)
+# Original authors: MCP / community contributors
+# Source: official MCP examples (client over STDIO + ClientSession)
+# License: MIT (see upstream LICENSE)
+# SPDX-License-Identifier: MIT
+#
+# Notes:
+# - This file is intentionally copied (vendored) to keep a stable client “shape”
+#   recommended by the official docs (initialize → list_tools → call_tool, using STDIO).
+# - Keep this file as-is. Project-specific code lives in the subclass.
+
+
+
 """
 
 import asyncio
