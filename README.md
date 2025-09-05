@@ -40,7 +40,7 @@ The DB is auto-seeded so the demo works right away.
 
 ### How to obtain a free Gemini API key (easy and quick)
 
-1) Open Google AI Studio in your browser: https://aistudio.google.com/
+1) Open Google AI Studio in your browser: https://aistudio.google.com/app/apikey
 2) Click “Get API key” and follow the prompts to create a key in your Google account.
 3) Copy the key and addo to your .env
 
