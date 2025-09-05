@@ -11,16 +11,16 @@ The goal is to keep the code straight to the point, readable, and close to real-
 
 Tested on: Docker 27.5.1 and Docker Compose v2.22.0
 
-1) Clone this repo into your machine
-2) Build and start containers:
-   docker-compose up -d --build
-3) Copy the environment template and set your key:
-   cp .env.example .env
-   # edit .env and set: GEMINI_API_KEY=...  
-4) Build application:
-   docker-compose up --build -d
-5) Start agent:
-   docker-compose command
+- Clone this repo into your machine
+- Copy the environment template and set your key:
+   ```cp .env.example .env```
+   edit .env and set: GEMINI_API_KEY=...  
+- Build application:
+   ```docker-compose up --build -d```
+- Start agent:
+  ```docker-compose exec dev bash```
+  On container's terminal:
+  ```python -m app.cli_agent```
 
 ## Environment Variables
 
