@@ -106,14 +106,35 @@ class TerminalCarAgent:
         ck = self._current_key()
         field_instr = ""
         if ck:
+            # Hint de tipo do campo atual (apenas para instrução do LLM)
+            string_fields = {"make", "model", "fuel", "color"}
+            numeric_fields = {"price_max", "year_min", "mileage_max"}
+            type_hint = (
+                "string" if ck in string_fields else
+                "numeric" if ck in numeric_fields else
+                "string"
+            )
+
             field_instr = (
                 f"\nCURRENT_FIELD: {ck}\n"
-                "When answering, focus ONLY on CURRENT_FIELD.\n"
-                "- If the message indicates 'skip', 'any', or 'no preference' for CURRENT_FIELD, "
-                "return that key explicitly with empty string \"\" (for string fields) or 0 (for numeric fields).\n"
-                "- If the message does not specify CURRENT_FIELD, return an empty JSON object {}.\n"
-                "- Do not include any other keys unless they were explicitly stated."
+                f"CURRENT_FIELD_TYPE: {type_hint}\n"
+                "TASK: Return a JSON object with any keys explicitly stated by the user in THIS message.\n"
+                "ALSO apply this special rule ONLY for CURRENT_FIELD:\n"
+                "  - If the message is negative for CURRENT_FIELD (e.g., 'no', 'none', 'nope', 'n/a', 'na', 'skip', 'any', "
+                "'no preference', or the line is blank), then include CURRENT_FIELD with empty string \"\" (if string) "
+                "or 0 (if numeric).\n"
+                "RULES:\n"
+                "  - Do NOT invent keys. Apart from the special rule above for CURRENT_FIELD, only include keys explicitly "
+                "stated in the text.\n"
+                "  - Never unset or change other keys implicitly; only output keys explicitly stated in this message or "
+                "the special CURRENT_FIELD mapping.\n"
+                "  - If nothing is extractable, return {}.\n"
+                "EXAMPLES (apply to this message only):\n"
+                "  Asked: budget; User: 'no' → {\"price_max\": 0}\n"
+                "  Asked: budget; User: 'No, I want a new Fiat since 2017' → {\"price_max\": 0, \"is_new\": true, \"make\": \"Fiat\", \"year_min\": 2017}\n"
+                "  Asked: brand;  User: 'I want a Honda under 30k' → {\"make\": \"Honda\", \"price_max\": 30000}\n"
             )
+
         return (
             f"{PROMPT}{field_instr}\n\n"
             f"User text:\n{user_text}\n\n"
