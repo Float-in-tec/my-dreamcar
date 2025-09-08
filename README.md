@@ -14,12 +14,16 @@ Tested on: Docker 27.5.1 and Docker Compose v2.22.0
 - Clone this repo into your machine
 - Copy the environment template and set your key:
    ```cp .env.example .env```
-   edit .env and set: GEMINI_API_KEY=...  
+   edit .env and set: GEMINI_API_KEY= (see below how to get free api keys)...  
+- Run start script ```./start.sh```
+
+  ### Alternatively, in case script doesn't work:
+  
 - Build application:
    ```docker-compose up --build -d```
 - Start agent:
   ```docker-compose exec dev bash```
-  On container's terminal:
+  and on container's terminal:
   ```python -m app.cli_agent```
 
 ## Environment Variables
