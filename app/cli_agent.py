@@ -83,7 +83,6 @@ class TerminalCarAgent:
             return False
 
         full = f"{GATEKEEPER_INSTRUCTION}\n\nUser input:\n{latest_user_text}"
-
         resp = self.client.models.generate_content(
             model=self.model_name,
             contents=[genai_types.Content(
@@ -101,7 +100,6 @@ class TerminalCarAgent:
             parsed = json.loads(raw)
         except Exception:
             parsed = raw.strip().strip('"')
-
         return str(parsed).strip().upper() == "PROCEED"
 
     async def run(self) -> None:
@@ -170,52 +168,24 @@ class TerminalCarAgent:
             args = json.loads((getattr(resp, "text", None) or "{}"))
             self.apply_extracted_filters(args)
 
-        # Sen query to mcp client
         c = CarClient()
         await c.initialize()
         try:
-            rows = await c.search_cars(
-                make=self.filters.get("make"),
-                fuel=self.filters.get("fuel"),
-                year_min=self.filters.get("year_min"),
-                price_max=self.filters.get("price_max"),
-                limit=50,
-            )
+            rows = await self.db_query(c, self.filters)
+
+            if not rows:
+                print("No exact match. Looking for similar results...")
+                nf = self.relax_filters(runs=1)
+                rows = await self.db_query(c, nf)
+
+            if not rows or len(rows) < 3:
+                print("Querying additional similar cars...")
+                nf = self.relax_filters(runs=2)
+                more = await self.db_query(c, nf)
+                if more:
+                    rows = (rows or []) + more
         finally:
             await c.close()
-
-        # If results are insufficient, look for similar results
-        if not rows:
-            print("No exact match. Looking for similar results...")
-            nf = self.relax_filters(runs=1)
-            c = CarClient(); await c.initialize()
-            try:
-                rows = await c.search_cars(
-                    make=nf.get("make"),
-                    fuel=nf.get("fuel"),
-                    year_min=nf.get("year_min"),
-                    price_max=nf.get("price_max"),
-                    limit=50,
-                )
-            finally:
-                await c.close()
-
-        if not rows or len(rows) < 3:
-            print("Querying additional similar cars...")
-            nf = self.relax_filters(runs=2)
-            c = CarClient(); await c.initialize()
-            try:
-                more = await c.search_cars(
-                    make=nf.get("make"),
-                    fuel=nf.get("fuel"),
-                    year_min=nf.get("year_min"),
-                    price_max=nf.get("price_max"),
-                    limit=50,
-                )
-            finally:
-                await c.close()
-            if more:
-                rows = (rows or []) + more
 
         if not rows:
             print("Sorry, at the moment we don't have cars available that matches your search. Please try again")
@@ -233,6 +203,19 @@ class TerminalCarAgent:
         print("\nType 'new' to start another search or 'exit' to quit.")
         if input("> ").strip().lower() in {"new","again","y","yes"}:
             self.__init__(); await self.run()
+
+    async def db_query(self, c: CarClient, query_filters: Dict[str, Any], limit: int = 50):
+        """
+        Consulta o MCP/DB com os filtros fornecidos e fecha o cliente corretamente.
+        nf: dict com make, fuel, year_min, price_max
+        """
+        return await c.search_cars(
+            make=query_filters.get("make"),
+            fuel=query_filters.get("fuel"),
+            year_min=query_filters.get("year_min"),
+            price_max=query_filters.get("price_max"),
+            limit=limit,
+        )
 
 if __name__ == "__main__":
     asyncio.run(TerminalCarAgent().run())
