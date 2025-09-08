@@ -102,6 +102,23 @@ class TerminalCarAgent:
             parsed = raw.strip().strip('"')
         return str(parsed).strip().upper() == "PROCEED"
 
+    def extract_and_apply(self, text: str) -> None:
+        full = self._build_extraction_prompt(text)
+        resp = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(full)]
+            )],
+            config=genai_types.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema=RESPONSE_SCHEMA,
+            ),
+        )
+        args = json.loads((getattr(resp, "text", None) or "{}"))
+        self.apply_extracted_filters(args)
+
     async def run(self) -> None:
         print(INTRO_HEADER)
         print(INTRO_EXAMPLES)
@@ -121,21 +138,7 @@ class TerminalCarAgent:
             if self.llm_wants_to_proceed(text):
                 break
 
-            full = self._build_extraction_prompt(text)
-            resp = self.client.models.generate_content(
-                model=self.model_name,
-                contents=[genai_types.Content(
-                    role="user",
-                    parts=[genai_types.Part.from_text(full)]
-                )],
-                config=genai_types.GenerateContentConfig(
-                    temperature=0,
-                    response_mime_type="application/json",
-                    response_schema=RESPONSE_SCHEMA,
-                ),
-            )
-            args = json.loads((getattr(resp, "text", None) or "{}"))
-            self.apply_extracted_filters(args)
+            self.extract_and_apply(text)
 
             if self.next_question() is not None:
                 if self.llm_wants_to_proceed(text):
@@ -152,21 +155,7 @@ class TerminalCarAgent:
             if self.llm_wants_to_proceed(t):
                 break
 
-            full2 = self._build_extraction_prompt(t)
-            resp = self.client.models.generate_content(
-                model=self.model_name,
-                contents=[genai_types.Content(
-                    role="user",
-                    parts=[genai_types.Part.from_text(full2)]
-                )],
-                config=genai_types.GenerateContentConfig(
-                    temperature=0,
-                    response_mime_type="application/json",
-                    response_schema=RESPONSE_SCHEMA,
-                ),
-            )
-            args = json.loads((getattr(resp, "text", None) or "{}"))
-            self.apply_extracted_filters(args)
+            self.extract_and_apply(t)
 
         c = CarClient()
         await c.initialize()
