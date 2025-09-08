@@ -1,23 +1,36 @@
 version: '3.8'
 
+x-db-env: &db_env
+  MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass}
+  MYSQL_DATABASE: ${MYSQL_DATABASE:-cars}
+  MYSQL_USER: ${MYSQL_USER:-car_user}
+  MYSQL_PASSWORD: ${MYSQL_PASSWORD:-car_pass}
+
+x-app-env: &app_env
+  DB_HOST: ${DB_HOST:-db}
+  DB_PORT: ${DB_PORT:-3306}
+  DB_NAME: ${MYSQL_DATABASE:-cars}
+  DB_USER: ${MYSQL_USER:-car_user}
+  DB_PASS: ${MYSQL_PASSWORD:-car_pass}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY is required}
+
 services:
   db:
     image: mysql:8.0
     command: ["--default-authentication-plugin=mysql_native_password"]
     container_name: db
-    environment: #hardcoded credentials just for the challenge. In real-case scenario set ENV VARS in .env
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass}
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-cars}
-      MYSQL_USER: ${MYSQL_USER:-car_user}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-car_pass}
+    env_file:
+      - .env
+    environment:
+      <<: *db_env
     ports:
-      - "3306:3306"
+      - "${DB_PORT:-3306}:3306"
     volumes:
       - ./app/sql:/docker-entrypoint-initdb.d
       - mysql_data:/var/lib/mysql
     restart: always
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-prootpass"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rootpass}"]
       interval: 5s
       timeout: 10s
       retries: 30
@@ -27,12 +40,10 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
-      DB_HOST: db
-      DB_PORT: 3306
-      DB_NAME: cars
-      DB_USER: car_user
-      DB_PASS: car_pass
+      <<: *app_env
     command: python3 -m app.services.seed_db
 
   dev:
@@ -40,12 +51,10 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
-      DB_HOST: db
-      DB_PORT: 3306
-      DB_NAME: cars
-      DB_USER: car_user
-      DB_PASS: car_pass
+      <<: *app_env
     volumes:
       - .:/app
     working_dir: /app
