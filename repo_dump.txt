@@ -1,0 +1,1874 @@
+===== ./docker-compose.yml =====
+version: '3.8'
+
+x-db-env: &db_env
+  MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass}
+  MYSQL_DATABASE: ${MYSQL_DATABASE:-cars}
+  MYSQL_USER: ${MYSQL_USER:-car_user}
+  MYSQL_PASSWORD: ${MYSQL_PASSWORD:-car_pass}
+
+x-app-env: &app_env
+  DB_HOST: ${DB_HOST:-db}
+  DB_PORT: ${DB_PORT:-3306}
+  DB_NAME: ${MYSQL_DATABASE:-cars}
+  DB_USER: ${MYSQL_USER:-car_user}
+  DB_PASS: ${MYSQL_PASSWORD:-car_pass}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY is required}
+
+services:
+  db:
+    image: mysql:8.0
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    container_name: db
+    env_file:
+      - .env
+    environment:
+      <<: *db_env
+    ports:
+      - "${DB_PORT:-3306}:3306"
+    volumes:
+      - ./app/sql:/docker-entrypoint-initdb.d
+      - mysql_data:/var/lib/mysql
+    restart: always
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rootpass}"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      <<: *app_env
+    command: python3 -m app.services.seed_db
+
+  dev:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      <<: *app_env
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: tail -f /dev/null
+
+volumes:
+  mysql_data:
+===== ./.env.example =====
+GEMINI_API_KEY=
+
+
+DB_HOST=db
+DB_PORT=3306
+
+MYSQL_ROOT_PASSWORD=rootpass
+MYSQL_DATABASE=cars
+MYSQL_USER=car_user
+MYSQL_PASSWORD=car_pass
+===== ./app/__init__.py =====
+# Author Yara
+===== ./app/mcp_client.py =====
+"""
+# Minimal. Adapting base class to be able to apply in our case.
+# Author: Yara
+# Created On: Sep 20205
+"""
+from __future__ import annotations
+import argparse, asyncio, json
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from app.vendor.mcp_client_base import Server
+
+CONFIG_PATH = Path(__file__).resolve().parent / "vendor" / "servers_config.json"
+
+class CarClient:
+    """
+    Start Server via STDIO using config JSON.
+    Expses search_cars(**filters) e normalizes returno to List[dict].
+    """
+    def __init__(self, server_name: str = "python", config_path: Path = CONFIG_PATH) -> None:
+        with open(config_path, "r", encoding="utf-8") as f:
+            all_cfg = json.load(f)
+        try:
+            cfg = all_cfg["mcpServers"][server_name]
+        except Exception as e:
+            raise RuntimeError(f"Config inválida em {config_path}: {e}")
+        self.server = Server(server_name, cfg)  # <- classe do vendor
+
+    async def initialize(self) -> None:
+        await self.server.initialize()
+
+    async def close(self) -> None:
+        await self.server.cleanup()
+
+    async def list_tools(self) -> List[str]:
+        tools = await self.server.list_tools()
+        names = []
+        for t in tools:
+            name = getattr(t, "name", None) or (isinstance(t, dict) and t.get("name"))
+            if name: names.append(str(name))
+        return names
+
+    async def search_cars(self, **filters: Any) -> List[Dict[str, Any]]:
+        tools = await self.list_tools()
+        if "search_cars" not in tools:
+            raise RuntimeError("Failed to find 'search_cars' tools.")
+        result = await self.server.execute_tool("search_cars", filters)
+        return self._normalize_rows(result)
+
+    def _normalize_rows(self, result: Any) -> List[Dict[str, Any]]:
+        """
+        Normalizes return as List[dict].
+        """
+        plain = getattr(result, "model_dump", lambda: result)()
+        content = (plain or {}).get("content") if isinstance(plain, dict) else getattr(result, "content", None)
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "json" and isinstance(part.get("data"), list):
+                    return part["data"]
+                if isinstance(part, dict) and part.get("type") == "text":
+                    try:
+                        parsed = json.loads(part.get("text", ""))
+                        if isinstance(parsed, list):
+                            return parsed
+                    except Exception:
+                        pass
+
+        if isinstance(plain, dict) and isinstance(plain.get("result"), list):
+            return plain["result"]
+
+        if isinstance(plain, list):
+            return plain
+        return []
+
+# ---------------- CLI smoke test ----------------
+
+async def _cli() -> None:
+    p = argparse.ArgumentParser(description="MCP client (vendor Server) — smoke test")
+    p.add_argument("--make")
+    p.add_argument("--fuel", choices=["gasoline","flex","diesel","electric","hybrid"])
+    p.add_argument("--year-min", type=int)
+    p.add_argument("--year-max", type=int)
+    p.add_argument("--price-min", type=int)
+    p.add_argument("--price-max", type=int)
+    p.add_argument("--limit", type=int, default=10)
+    a = p.parse_args()
+
+    filters = {k: v for k, v in {
+        "make": a.make, "fuel": a.fuel, "year_min": a.year_min, "year_max": a.year_max,
+        "price_min": a.price_min, "price_max": a.price_max, "limit": a.limit
+    }.items() if v is not None}
+
+    client = CarClient()
+    try:
+        await client.initialize()
+        rows = await client.search_cars(**filters)
+        if not rows:
+            print("No results")
+            return
+        for i, car in enumerate(rows, 1):
+            if not isinstance(car, dict):
+                print(f"- {i}. {car}")
+                continue
+            price = car.get("dollar_price")
+            price_fmt = f"US${int(price):,}".replace(",", ".") if isinstance(price, (int, float)) else price
+            print(f"- {i}. {car.get('make')} {car.get('model')} {car.get('year')}, "
+                  f"{car.get('color')}, {car.get('mileage')} km, {price_fmt}")
+    finally:
+        await client.close()
+
+if __name__ == "__main__":
+    asyncio.run(_cli())
+===== ./app/vendor/__init__.py =====
+#
+===== ./app/vendor/servers_config.json =====
+{
+  "mcpServers": {
+    "python": {
+      "command": "python",
+      "args": ["-m", "app.mcp_server"],
+      "env": {}
+    }
+  }
+}
+===== ./app/vendor/mcp_client_base.py =====
+"""
+# All file extracted(copy/pasted) from: https://github.com/modelcontextprotocol/python-sdk/blob/main/examples/clients/simple-chatbot/mcp_simple_chatbot/main.py
+# This will be used as base for my mcp_client.
+
+# Vendored from: Model Context Protocol Python SDK (examples / client)
+# Original authors: MCP / community contributors
+# Source: official MCP examples (client over STDIO + ClientSession)
+# License: MIT (see upstream LICENSE)
+# SPDX-License-Identifier: MIT
+#
+# Notes:
+# - This file is intentionally copied (vendored) to keep a stable client “shape”
+#   recommended by the official docs (initialize → list_tools → call_tool, using STDIO).
+# - Keep this file as-is. Project-specific code lives in the subclass.
+
+
+
+"""
+
+import asyncio
+import json
+import logging
+import os
+import shutil
+from contextlib import AsyncExitStack
+from typing import Any
+
+import httpx
+from dotenv import load_dotenv
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+class Configuration:
+    """Manages configuration and environment variables for the MCP client."""
+
+    def __init__(self) -> None:
+        """Initialize configuration with environment variables."""
+        self.load_env()
+        self.api_key = os.getenv("LLM_API_KEY")
+
+    @staticmethod
+    def load_env() -> None:
+        """Load environment variables from .env file."""
+        load_dotenv()
+
+    @staticmethod
+    def load_config(file_path: str) -> dict[str, Any]:
+        """Load server configuration from JSON file.
+
+        Args:
+            file_path: Path to the JSON configuration file.
+
+        Returns:
+            Dict containing server configuration.
+
+        Raises:
+            FileNotFoundError: If configuration file doesn't exist.
+            JSONDecodeError: If configuration file is invalid JSON.
+        """
+        with open(file_path, "r") as f:
+            return json.load(f)
+
+    @property
+    def llm_api_key(self) -> str:
+        """Get the LLM API key.
+
+        Returns:
+            The API key as a string.
+
+        Raises:
+            ValueError: If the API key is not found in environment variables.
+        """
+        if not self.api_key:
+            raise ValueError("LLM_API_KEY not found in environment variables")
+        return self.api_key
+
+
+class Server:
+    """Manages MCP server connections and tool execution."""
+
+    def __init__(self, name: str, config: dict[str, Any]) -> None:
+        self.name: str = name
+        self.config: dict[str, Any] = config
+        self.stdio_context: Any | None = None
+        self.session: ClientSession | None = None
+        self._cleanup_lock: asyncio.Lock = asyncio.Lock()
+        self.exit_stack: AsyncExitStack = AsyncExitStack()
+
+    async def initialize(self) -> None:
+        """Initialize the server connection."""
+        command = shutil.which("npx") if self.config["command"] == "npx" else self.config["command"]
+        if command is None:
+            raise ValueError("The command must be a valid string and cannot be None.")
+
+        server_params = StdioServerParameters(
+            command=command,
+            args=self.config["args"],
+            env={**os.environ, **self.config["env"]} if self.config.get("env") else None,
+        )
+        try:
+            stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
+            read, write = stdio_transport
+            session = await self.exit_stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+            self.session = session
+        except Exception as e:
+            logging.error(f"Error initializing server {self.name}: {e}")
+            await self.cleanup()
+            raise
+
+    async def list_tools(self) -> list[Any]:
+        """List available tools from the server.
+
+        Returns:
+            A list of available tools.
+
+        Raises:
+            RuntimeError: If the server is not initialized.
+        """
+        if not self.session:
+            raise RuntimeError(f"Server {self.name} not initialized")
+
+        tools_response = await self.session.list_tools()
+        tools = []
+
+        for item in tools_response:
+            if isinstance(item, tuple) and item[0] == "tools":
+                tools.extend(Tool(tool.name, tool.description, tool.inputSchema, tool.title) for tool in item[1])
+
+        return tools
+
+    async def execute_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        retries: int = 2,
+        delay: float = 1.0,
+    ) -> Any:
+        """Execute a tool with retry mechanism.
+
+        Args:
+            tool_name: Name of the tool to execute.
+            arguments: Tool arguments.
+            retries: Number of retry attempts.
+            delay: Delay between retries in seconds.
+
+        Returns:
+            Tool execution result.
+
+        Raises:
+            RuntimeError: If server is not initialized.
+            Exception: If tool execution fails after all retries.
+        """
+        if not self.session:
+            raise RuntimeError(f"Server {self.name} not initialized")
+
+        attempt = 0
+        while attempt < retries:
+            try:
+                logging.info(f"Executing {tool_name}...")
+                result = await self.session.call_tool(tool_name, arguments)
+
+                return result
+
+            except Exception as e:
+                attempt += 1
+                logging.warning(f"Error executing tool: {e}. Attempt {attempt} of {retries}.")
+                if attempt < retries:
+                    logging.info(f"Retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    logging.error("Max retries reached. Failing.")
+                    raise
+
+    async def cleanup(self) -> None:
+        """Clean up server resources."""
+        async with self._cleanup_lock:
+            try:
+                await self.exit_stack.aclose()
+                self.session = None
+                self.stdio_context = None
+            except Exception as e:
+                logging.error(f"Error during cleanup of server {self.name}: {e}")
+
+
+class Tool:
+    """Represents a tool with its properties and formatting."""
+
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        input_schema: dict[str, Any],
+        title: str | None = None,
+    ) -> None:
+        self.name: str = name
+        self.title: str | None = title
+        self.description: str = description
+        self.input_schema: dict[str, Any] = input_schema
+
+    def format_for_llm(self) -> str:
+        """Format tool information for LLM.
+
+        Returns:
+            A formatted string describing the tool.
+        """
+        args_desc = []
+        if "properties" in self.input_schema:
+            for param_name, param_info in self.input_schema["properties"].items():
+                arg_desc = f"- {param_name}: {param_info.get('description', 'No description')}"
+                if param_name in self.input_schema.get("required", []):
+                    arg_desc += " (required)"
+                args_desc.append(arg_desc)
+
+        # Build the formatted output with title as a separate field
+        output = f"Tool: {self.name}\n"
+
+        # Add human-readable title if available
+        if self.title:
+            output += f"User-readable title: {self.title}\n"
+
+        output += f"""Description: {self.description}
+Arguments:
+{chr(10).join(args_desc)}
+"""
+
+        return output
+
+
+class LLMClient:
+    """Manages communication with the LLM provider."""
+
+    def __init__(self, api_key: str) -> None:
+        self.api_key: str = api_key
+
+    def get_response(self, messages: list[dict[str, str]]) -> str:
+        """Get a response from the LLM.
+
+        Args:
+            messages: A list of message dictionaries.
+
+        Returns:
+            The LLM's response as a string.
+
+        Raises:
+            httpx.RequestError: If the request to the LLM fails.
+        """
+        url = "https://api.groq.com/openai/v1/chat/completions"
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload = {
+            "messages": messages,
+            "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+            "temperature": 0.7,
+            "max_tokens": 4096,
+            "top_p": 1,
+            "stream": False,
+            "stop": None,
+        }
+
+        try:
+            with httpx.Client() as client:
+                response = client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+
+        except httpx.RequestError as e:
+            error_message = f"Error getting LLM response: {str(e)}"
+            logging.error(error_message)
+
+            if isinstance(e, httpx.HTTPStatusError):
+                status_code = e.response.status_code
+                logging.error(f"Status code: {status_code}")
+                logging.error(f"Response details: {e.response.text}")
+
+            return f"I encountered an error: {error_message}. Please try again or rephrase your request."
+
+
+class ChatSession:
+    """Orchestrates the interaction between user, LLM, and tools."""
+
+    def __init__(self, servers: list[Server], llm_client: LLMClient) -> None:
+        self.servers: list[Server] = servers
+        self.llm_client: LLMClient = llm_client
+
+    async def cleanup_servers(self) -> None:
+        """Clean up all servers properly."""
+        for server in reversed(self.servers):
+            try:
+                await server.cleanup()
+            except Exception as e:
+                logging.warning(f"Warning during final cleanup: {e}")
+
+    async def process_llm_response(self, llm_response: str) -> str:
+        """Process the LLM response and execute tools if needed.
+
+        Args:
+            llm_response: The response from the LLM.
+
+        Returns:
+            The result of tool execution or the original response.
+        """
+        import json
+
+        try:
+            tool_call = json.loads(llm_response)
+            if "tool" in tool_call and "arguments" in tool_call:
+                logging.info(f"Executing tool: {tool_call['tool']}")
+                logging.info(f"With arguments: {tool_call['arguments']}")
+
+                for server in self.servers:
+                    tools = await server.list_tools()
+                    if any(tool.name == tool_call["tool"] for tool in tools):
+                        try:
+                            result = await server.execute_tool(tool_call["tool"], tool_call["arguments"])
+
+                            if isinstance(result, dict) and "progress" in result:
+                                progress = result["progress"]
+                                total = result["total"]
+                                percentage = (progress / total) * 100
+                                logging.info(f"Progress: {progress}/{total} ({percentage:.1f}%)")
+
+                            return f"Tool execution result: {result}"
+                        except Exception as e:
+                            error_msg = f"Error executing tool: {str(e)}"
+                            logging.error(error_msg)
+                            return error_msg
+
+                return f"No server found with tool: {tool_call['tool']}"
+            return llm_response
+        except json.JSONDecodeError:
+            return llm_response
+
+    async def start(self) -> None:
+        """Main chat session handler."""
+        try:
+            for server in self.servers:
+                try:
+                    await server.initialize()
+                except Exception as e:
+                    logging.error(f"Failed to initialize server: {e}")
+                    await self.cleanup_servers()
+                    return
+
+            all_tools = []
+            for server in self.servers:
+                tools = await server.list_tools()
+                all_tools.extend(tools)
+
+            tools_description = "\n".join([tool.format_for_llm() for tool in all_tools])
+
+            system_message = (
+                "You are a helpful assistant with access to these tools:\n\n"
+                f"{tools_description}\n"
+                "Choose the appropriate tool based on the user's question. "
+                "If no tool is needed, reply directly.\n\n"
+                "IMPORTANT: When you need to use a tool, you must ONLY respond with "
+                "the exact JSON object format below, nothing else:\n"
+                "{\n"
+                '    "tool": "tool-name",\n'
+                '    "arguments": {\n'
+                '        "argument-name": "value"\n'
+                "    }\n"
+                "}\n\n"
+                "After receiving a tool's response:\n"
+                "1. Transform the raw data into a natural, conversational response\n"
+                "2. Keep responses concise but informative\n"
+                "3. Focus on the most relevant information\n"
+                "4. Use appropriate context from the user's question\n"
+                "5. Avoid simply repeating the raw data\n\n"
+                "Please use only the tools that are explicitly defined above."
+            )
+
+            messages = [{"role": "system", "content": system_message}]
+
+            while True:
+                try:
+                    user_input = input("You: ").strip().lower()
+                    if user_input in ["quit", "exit"]:
+                        logging.info("\nExiting...")
+                        break
+
+                    messages.append({"role": "user", "content": user_input})
+
+                    llm_response = self.llm_client.get_response(messages)
+                    logging.info("\nAssistant: %s", llm_response)
+
+                    result = await self.process_llm_response(llm_response)
+
+                    if result != llm_response:
+                        messages.append({"role": "assistant", "content": llm_response})
+                        messages.append({"role": "system", "content": result})
+
+                        final_response = self.llm_client.get_response(messages)
+                        logging.info("\nFinal response: %s", final_response)
+                        messages.append({"role": "assistant", "content": final_response})
+                    else:
+                        messages.append({"role": "assistant", "content": llm_response})
+
+                except KeyboardInterrupt:
+                    logging.info("\nExiting...")
+                    break
+
+        finally:
+            await self.cleanup_servers()
+
+
+async def main() -> None:
+    """Initialize and run the chat session."""
+    config = Configuration()
+    server_config = config.load_config("servers_config.json")
+    servers = [Server(name, srv_config) for name, srv_config in server_config["mcpServers"].items()]
+    llm_client = LLMClient(config.llm_api_key)
+    chat_session = ChatSession(servers, llm_client)
+    await chat_session.start()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+===== ./app/agent.bkp =====
+"""
+Author: Yara
+"""
+from __future__ import annotations
+import asyncio, json, os
+from typing import Any, Dict, Optional
+from google import genai
+from google.genai import types as genai_types
+from app.mcp_client import CarClient
+from app.prompts.car_agent_prompts import build_extraction_prompt, GATEKEEPER_INSTRUCTION
+from app.prompts.car_agent_texts import (
+    KEY_ORDER,
+    RESPONSE_SCHEMA,
+    PROCEED_SCHEMA,
+    QUESTIONS_MAP,
+    INTRO_HEADER,
+    INTRO_EXAMPLES,
+    EXTRA_CONSTRAINTS_PROMPT,
+)
+
+class TerminalCarAgent:
+    def __init__(self) -> None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise SystemExit("Requires environment variable GEMINI_API_KEY.")
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = "gemini-2.0-flash"  # free-tier-elegible
+
+        # Unified controller dict
+        self.filters: Dict[str, Any] = {
+            "make": None, "model": None, "fuel": None, "color": None,
+            "year_min": None, "price_max": None, "mileage_max": None,
+            "is_new": None, "is_automatic": None,
+            "has_air_conditioning": None, "has_bt_radio": None,
+            "has_charger_plug": None, "is_armored": None,
+        }
+
+    def apply_extracted_filters(self, parsed: Dict[str, Any]) -> None:
+        for k, v in (parsed or {}).items():
+            if k in ("make","model","fuel","color"):
+                self.filters[k] = "" if v is None else str(v)
+            elif k in ("year_min","price_max","mileage_max"):
+                self.filters[k] = 0 if v is None else int(v)
+            elif k in ("is_new","is_automatic","has_air_conditioning","has_bt_radio",
+                       "has_charger_plug","is_armored"):
+                if v is not None:
+                    self.filters[k] = bool(v)
+
+    def relax_filters(self, runs: int) -> Dict[str, Any]:
+        relaxed = dict(self.filters)
+        if runs > 1:
+            relaxed["make"] = ""      # drop make e encerra
+            return relaxed
+        relaxed["model"] = ""         # sem preferência de modelo
+        y = relaxed.get("year_min")
+        if isinstance(y, int) and y and y > 1980:
+            relaxed["year_min"] = max(1980, y - 3)
+        p = relaxed.get("price_max")
+        if isinstance(p, int) and p:
+            relaxed["price_max"] = int(p * 1.25)
+        return relaxed
+
+    def _current_key(self) -> Optional[str]:
+        for k in KEY_ORDER:
+            if self.filters.get(k) is None:
+                return k
+        return None
+
+    def _build_extraction_prompt(self, user_text: str) -> str:
+        return build_extraction_prompt(user_text, self._current_key())
+
+    def next_question(self) -> Optional[str]:
+        for key in KEY_ORDER:
+            if self.filters.get(key) is None:
+                return QUESTIONS_MAP[key]
+        return None
+
+    def llm_wants_to_proceed(self, latest_user_text: str) -> bool:
+        if self.next_question() is not None:
+            return False
+
+        full = f"{GATEKEEPER_INSTRUCTION}\n\nUser input:\n{latest_user_text}"
+
+        resp = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(full)]
+            )],
+            config=genai_types.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema=PROCEED_SCHEMA,
+            ),
+        )
+        raw = (getattr(resp, "text", None) or "")
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = raw.strip().strip('"')
+
+        return str(parsed).strip().upper() == "PROCEED"
+
+    async def run(self) -> None:
+        print(INTRO_HEADER)
+        print(INTRO_EXAMPLES)
+
+        q = self.next_question()
+        if q: print(q)
+
+        while True:
+            text = input("> ").strip()
+            if not text:
+                if (q := self.next_question()): print(q)
+                continue
+
+            low = text.lower()
+            if low in {"exit","quit","sair"}:
+                print("Bye."); return
+            if self.llm_wants_to_proceed(text):
+                break
+
+            full = self._build_extraction_prompt(text)
+            resp = self.client.models.generate_content(
+                model=self.model_name,
+                contents=[genai_types.Content(
+                    role="user",
+                    parts=[genai_types.Part.from_text(full)]
+                )],
+                config=genai_types.GenerateContentConfig(
+                    temperature=0,
+                    response_mime_type="application/json",
+                    response_schema=RESPONSE_SCHEMA,
+                ),
+            )
+            args = json.loads((getattr(resp, "text", None) or "{}"))
+            self.apply_extracted_filters(args)
+
+            if self.next_question() is not None:
+                if self.llm_wants_to_proceed(text):
+                    break
+
+            if (q := self.next_question()):
+                print(q)
+            else:
+                break
+
+        print(EXTRA_CONSTRAINTS_PROMPT)
+        while True:
+            t = input("> ").strip()
+            if self.llm_wants_to_proceed(t):
+                break
+
+            full2 = self._build_extraction_prompt(t)
+            resp = self.client.models.generate_content(
+                model=self.model_name,
+                contents=[genai_types.Content(
+                    role="user",
+                    parts=[genai_types.Part.from_text(full2)]
+                )],
+                config=genai_types.GenerateContentConfig(
+                    temperature=0,
+                    response_mime_type="application/json",
+                    response_schema=RESPONSE_SCHEMA,
+                ),
+            )
+            args = json.loads((getattr(resp, "text", None) or "{}"))
+            self.apply_extracted_filters(args)
+
+        # Sen query to mcp client
+        c = CarClient()
+        await c.initialize()
+        try:
+            rows = await c.search_cars(
+                make=self.filters.get("make"),
+                fuel=self.filters.get("fuel"),
+                year_min=self.filters.get("year_min"),
+                price_max=self.filters.get("price_max"),
+                limit=50,
+            )
+        finally:
+            await c.close()
+
+        if not rows:
+            print("No exact match. Looking for similar results...")
+            nf = self.relax_filters(runs=1)
+            c = CarClient(); await c.initialize()
+            try:
+                rows = await c.search_cars(
+                    make=nf.get("make"),
+                    fuel=nf.get("fuel"),
+                    year_min=nf.get("year_min"),
+                    price_max=nf.get("price_max"),
+                    limit=50,
+                )
+            finally:
+                await c.close()
+
+        if not rows or len(rows) < 3:
+            print("Querying additional similar cars...")
+            nf = self.relax_filters(runs=2)
+            c = CarClient(); await c.initialize()
+            try:
+                more = await c.search_cars(
+                    make=nf.get("make"),
+                    fuel=nf.get("fuel"),
+                    year_min=nf.get("year_min"),
+                    price_max=nf.get("price_max"),
+                    limit=50,
+                )
+            finally:
+                await c.close()
+            if more:
+                rows = (rows or []) + more
+
+        if not rows:
+            print("Sorry, at the moment we don't have cars available that matches your search. Please try again")
+            return
+
+        print("\nResults:")
+        for i, car in enumerate(rows, 1):
+            make = car.get("make"); model = car.get("model")
+            year = car.get("year"); color = car.get("color")
+            mileage = car.get("mileage"); price = car.get("dollar_price")
+            km = f"{int(mileage):,}".replace(",", ".") if isinstance(mileage,(int,float)) else str(mileage)
+            pr = "US$ " + f"{int(price):,}".replace(",", ".") if isinstance(price,(int,float)) else str(price)
+            print(f"- {i}. {make} {model} {year}, {color}, {km} km, {pr}")
+
+        print("\nType 'new' to start another search or 'exit' to quit.")
+        if input("> ").strip().lower() in {"new","again","y","yes"}:
+            self.__init__(); await self.run()
+
+if __name__ == "__main__":
+    asyncio.run(TerminalCarAgent().run())
+===== ./app/prompts/__init__.py =====
+# Author Yara
+===== ./app/prompts/car_agent_texts.py =====
+# app/prompts/car_agent_texts.py
+
+# Ordem das perguntas base
+KEY_ORDER = ["price_max", "make", "model", "year_min", "fuel"]
+
+# Schemas (usados no response_schema do google-genai)
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "make": {"type": "string"},
+        "model": {"type": "string"},
+        "fuel":  {"type": "string", "enum": ["gasoline","flex","diesel","electric","hybrid"]},
+        "year_min": {"type": "integer"},
+        "price_max": {"type": "integer"},
+        "mileage_max": {"type": "integer"},
+        "is_new": {"type": "boolean"},
+        "is_automatic": {"type": "boolean"},
+        "has_air_conditioning": {"type": "boolean"},
+        "has_bt_radio": {"type": "boolean"},
+        "has_charger_plug": {"type": "boolean"},
+        "is_armored": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
+
+PROCEED_SCHEMA = {
+    "type": "string",
+    "enum": ["PROCEED", "ASK"]
+}
+
+# Mapa de perguntas (next_question)
+QUESTIONS_MAP = {
+    "price_max": "Do you have a budget in USD? (e.g., 'under 20k')",
+    "make":      "Any preferred brand? (e.g., Toyota, Lexus; or 'any')",
+    "model":     "Any specific model? (you can skip)",
+    "year_min":  "Minimum fabrication year? (e.g., 'since 2018')",
+    "fuel":      "Preferred fuel? (gasoline, flex, diesel, electric, hybrid; or 'any')",
+}
+
+# Textos de interface
+INTRO_HEADER = (
+    "Car finder. Free-form conversation. Type 'search' when ready; 'exit' to quit.\n"
+)
+
+INTRO_EXAMPLES = (
+    "Examples:\n- 'I want a Honda under 30k'\n- 'Since 2018, hybrid, under 25k'\n"
+)
+
+EXTRA_CONSTRAINTS_PROMPT = (
+    "\nAny extra constraints before I search?\n"
+    "- mileage max\n"
+    "- new or used\n"
+    "- automatic or manual\n"
+    "- air conditioning\n"
+    "- Bluetooth radio\n"
+    "- charger plug\n"
+    "- armored\n"
+    "(If none, type 'search')"
+)
+===== ./app/prompts/car_agent_prompts.py =====
+# app/prompts/car_agent_prompts.py
+from typing import Optional
+
+# Prompt base para extração de filtros
+PROMPT_BASE = (
+    "Extract car-shopping filters from English free text.\n"
+    "- OUTPUT POLICY:\n"
+    "  * Include ONLY the keys the user explicitly stated.\n"
+    "  * Do NOT guess or infer unspecified fields.\n"
+    "  * For brand/model/fuel:\n"
+    "      - If the user says 'any' or 'no preference', return an empty string \"\".\n"
+    "      - If the user does not specify, OMIT the key.\n"
+    "  * For numeric fields (price, mileage, etc.):\n"
+    "      - If the user says 'no limit', return 0.\n"
+    "      - If the user does not specify, OMIT the key.\n"
+    "- Interpret 'under 20k' => price_max=20000; 'since 2018' => year_min=2018.\n"
+    "- Fuels: gasoline, flex, diesel, electric, hybrid. Prices in USD. Mileage in kilometers.\n"
+    "Return ONLY a JSON object that matches the schema. Do not wrap in markdown. No extra text.\n"
+)
+
+# Prompt do gatekeeper (decidir se prossegue)
+GATEKEEPER_INSTRUCTION = (
+    "You are a strict gatekeeper. Decide if the user explicitly asked to proceed with the search now.\n"
+    "Respond with EXACTLY ONE of: PROCEED or ASK.\n"
+    "Return PROCEED ONLY if the user clearly expressed intent to start the search using phrases like:\n"
+    "  'search', 'go', 'run', 'proceed', 'ready', \"that's it\", \"let's search\", "
+    "'please search', 'query', 'enough questions', 'done', 'finish'.\n"
+    "For any other message (including more preferences), return ASK.\n"
+)
+
+def build_extraction_prompt(user_text: str, current_key: Optional[str]) -> str:
+    """
+    Monta o prompt de extração aceitando múltiplas chaves mencionadas na mesma mensagem
+    e aplicando a regra de 'negativo' somente ao campo atual (CURRENT_FIELD).
+    """
+    field_instr = ""
+    if current_key:
+        string_fields = {"make", "model", "fuel", "color"}
+        numeric_fields = {"price_max", "year_min", "mileage_max"}
+        type_hint = (
+            "string" if current_key in string_fields else
+            "numeric" if current_key in numeric_fields else
+            "string"
+        )
+        field_instr = (
+            f"\nCURRENT_FIELD: {current_key}\n"
+            f"CURRENT_FIELD_TYPE: {type_hint}\n"
+            "TASK: Return a JSON object with any keys explicitly stated by the user in THIS message.\n"
+            "ALSO apply this special rule ONLY for CURRENT_FIELD:\n"
+            "  - If the message is negative for CURRENT_FIELD (e.g., 'no', 'none', 'nope', 'n/a', 'na', 'skip', 'any', "
+            "'no preference', or the line is blank), then include CURRENT_FIELD with empty string \"\" (if string) "
+            "or 0 (if numeric).\n"
+            "RULES:\n"
+            "  - Do NOT invent keys. Apart from the special rule above for CURRENT_FIELD, only include keys explicitly "
+            "stated in the text.\n"
+            "  - Never unset or change other keys implicitly; only output keys explicitly stated in this message or "
+            "the special CURRENT_FIELD mapping.\n"
+            "  - If nothing is extractable, return {}.\n"
+            "EXAMPLES (apply to this message only):\n"
+            "  Asked: budget; User: 'no' → {\"price_max\": 0}\n"
+            "  Asked: budget; User: 'No, I want a new Fiat since 2017' → "
+            "{\"price_max\": 0, \"is_new\": true, \"make\": \"Fiat\", \"year_min\": 2017}\n"
+            "  Asked: brand;  User: 'I want a Honda under 30k' → {\"make\": \"Honda\", \"price_max\": 30000}\n"
+        )
+
+    return (
+        f"{PROMPT_BASE}{field_instr}\n\n"
+        f"User text:\n{user_text}\n\n"
+        f"Return ONLY a valid JSON object that matches the schema."
+    )
+===== ./app/agent.bkp2 =====
+"""
+Author: Yara
+"""
+from __future__ import annotations
+import asyncio, json, os
+from typing import Any, Dict, Optional
+
+from google import genai
+from google.genai import types as genai_types
+from app.mcp_client import CarClient
+
+from app.prompts.car_agent_prompts import build_extraction_prompt, GATEKEEPER_INSTRUCTION
+from app.prompts.car_agent_texts import (
+    KEY_ORDER,
+    RESPONSE_SCHEMA,
+    PROCEED_SCHEMA,
+    QUESTIONS_MAP,
+    INTRO_HEADER,
+    INTRO_EXAMPLES,
+    EXTRA_CONSTRAINTS_PROMPT,
+)
+
+class TerminalCarAgent:
+    def __init__(self) -> None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise SystemExit("Requires environment variable GEMINI_API_KEY.")
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = "gemini-2.0-flash"  # free-tier-elegible
+
+        self.filters: Dict[str, Any] = {
+            "make": None, "model": None, "fuel": None, "color": None,
+            "year_min": None, "price_max": None, "mileage_max": None,
+            "is_new": None, "is_automatic": None,
+            "has_air_conditioning": None, "has_bt_radio": None,
+            "has_charger_plug": None, "is_armored": None,
+        }
+
+    def apply_extracted_filters(self, parsed: Dict[str, Any]) -> None:
+        for k, v in (parsed or {}).items():
+            if k in ("make","model","fuel","color"):
+                self.filters[k] = "" if v is None else str(v)
+            elif k in ("year_min","price_max","mileage_max"):
+                self.filters[k] = 0 if v is None else int(v)
+            elif k in ("is_new","is_automatic","has_air_conditioning","has_bt_radio",
+                       "has_charger_plug","is_armored"):
+                if v is not None:
+                    self.filters[k] = bool(v)
+
+    def relax_filters(self, runs: int) -> Dict[str, Any]:
+        relaxed = dict(self.filters)
+        if runs > 1:
+            relaxed["make"] = ""
+            return relaxed
+        relaxed["model"] = ""
+        y = relaxed.get("year_min")
+        if isinstance(y, int) and y and y > 1980:
+            relaxed["year_min"] = max(1980, y - 3)
+        p = relaxed.get("price_max")
+        if isinstance(p, int) and p:
+            relaxed["price_max"] = int(p * 1.25)
+        return relaxed
+
+    def _current_key(self) -> Optional[str]:
+        for k in KEY_ORDER:
+            if self.filters.get(k) is None:
+                return k
+        return None
+
+    def _build_extraction_prompt(self, user_text: str) -> str:
+        return build_extraction_prompt(user_text, self._current_key())
+
+    def next_question(self) -> Optional[str]:
+        for key in KEY_ORDER:
+            if self.filters.get(key) is None:
+                return QUESTIONS_MAP[key]
+        return None
+
+    def llm_wants_to_proceed(self, latest_user_text: str) -> bool:
+        if self.next_question() is not None:
+            return False
+
+        full = f"{GATEKEEPER_INSTRUCTION}\n\nUser input:\n{latest_user_text}"
+        resp = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(full)]
+            )],
+            config=genai_types.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema=PROCEED_SCHEMA,
+            ),
+        )
+        raw = (getattr(resp, "text", None) or "")
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = raw.strip().strip('"')
+        return str(parsed).strip().upper() == "PROCEED"
+
+    async def run(self) -> None:
+        print(INTRO_HEADER)
+        print(INTRO_EXAMPLES)
+
+        q = self.next_question()
+        if q: print(q)
+
+        while True:
+            text = input("> ").strip()
+            if not text:
+                if (q := self.next_question()): print(q)
+                continue
+
+            low = text.lower()
+            if low in {"exit","quit","sair"}:
+                print("Bye."); return
+            if self.llm_wants_to_proceed(text):
+                break
+
+            full = self._build_extraction_prompt(text)
+            resp = self.client.models.generate_content(
+                model=self.model_name,
+                contents=[genai_types.Content(
+                    role="user",
+                    parts=[genai_types.Part.from_text(full)]
+                )],
+                config=genai_types.GenerateContentConfig(
+                    temperature=0,
+                    response_mime_type="application/json",
+                    response_schema=RESPONSE_SCHEMA,
+                ),
+            )
+            args = json.loads((getattr(resp, "text", None) or "{}"))
+            self.apply_extracted_filters(args)
+
+            if self.next_question() is not None:
+                if self.llm_wants_to_proceed(text):
+                    break
+
+            if (q := self.next_question()):
+                print(q)
+            else:
+                break
+
+        print(EXTRA_CONSTRAINTS_PROMPT)
+        while True:
+            t = input("> ").strip()
+            if self.llm_wants_to_proceed(t):
+                break
+
+            full2 = self._build_extraction_prompt(t)
+            resp = self.client.models.generate_content(
+                model=self.model_name,
+                contents=[genai_types.Content(
+                    role="user",
+                    parts=[genai_types.Part.from_text(full2)]
+                )],
+                config=genai_types.GenerateContentConfig(
+                    temperature=0,
+                    response_mime_type="application/json",
+                    response_schema=RESPONSE_SCHEMA,
+                ),
+            )
+            args = json.loads((getattr(resp, "text", None) or "{}"))
+            self.apply_extracted_filters(args)
+
+        c = CarClient()
+        await c.initialize()
+        try:
+            rows = await self.db_query(c, self.filters)
+
+            if not rows:
+                print("No exact match. Looking for similar results...")
+                nf = self.relax_filters(runs=1)
+                rows = await self.db_query(c, nf)
+
+            if not rows or len(rows) < 3:
+                print("Querying additional similar cars...")
+                nf = self.relax_filters(runs=2)
+                more = await self.db_query(c, nf)
+                if more:
+                    rows = (rows or []) + more
+        finally:
+            await c.close()
+
+        if not rows:
+            print("Sorry, at the moment we don't have cars available that matches your search. Please try again")
+            return
+
+        print("\nResults:")
+        for i, car in enumerate(rows, 1):
+            make = car.get("make"); model = car.get("model")
+            year = car.get("year"); color = car.get("color")
+            mileage = car.get("mileage"); price = car.get("dollar_price")
+            km = f"{int(mileage):,}".replace(",", ".") if isinstance(mileage,(int,float)) else str(mileage)
+            pr = "US$ " + f"{int(price):,}".replace(",", ".") if isinstance(price,(int,float)) else str(price)
+            print(f"- {i}. {make} {model} {year}, {color}, {km} km, {pr}")
+
+        print("\nType 'new' to start another search or 'exit' to quit.")
+        if input("> ").strip().lower() in {"new","again","y","yes"}:
+            self.__init__(); await self.run()
+
+    async def db_query(self, c: CarClient, query_filters: Dict[str, Any], limit: int = 50):
+        """
+        Consulta o MCP/DB com os filtros fornecidos e fecha o cliente corretamente.
+        nf: dict com make, fuel, year_min, price_max
+        """
+        return await c.search_cars(
+            make=query_filters.get("make"),
+            fuel=query_filters.get("fuel"),
+            year_min=query_filters.get("year_min"),
+            price_max=query_filters.get("price_max"),
+            limit=limit,
+        )
+
+if __name__ == "__main__":
+    asyncio.run(TerminalCarAgent().run())
+===== ./app/db_utils/__init__.py =====
+# Author Yara
+===== ./app/db_utils/db_connection.py =====
+"""
+Created on Aug 2025
+@author: Yara
+"""
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.pool import QueuePool
+import os
+import json
+
+class DBConn:
+    def __init__(self, db_label: str = "main"):
+        self.db_label = db_label
+        self.session: Session = None
+        self.engine = None
+        self.db_config = self._load_db_config()
+
+    def _load_db_config(self):
+        """Load DB config from environment (scalable to multiple DBs)."""
+        db_config = {
+            "main": {
+                "driver": os.getenv("DB_DRIVER", "mysql+pymysql"),
+                "user": os.getenv("DB_USER", "car_user"),
+                "pwd": os.getenv("DB_PASS", "car_pass"), #hardcoded password and credentials just for the challenge. In real-case scenario use ENV VAR
+                "addr": os.getenv("DB_HOST", "db"),
+                "port": os.getenv("DB_PORT", "3306"),
+                "db_name": os.getenv("DB_NAME", "cars"),
+                "pool_size": int(os.getenv("DB_POOL_SIZE", "15")),
+                "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "20")),
+                "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "3600")),
+            }
+        }
+        return db_config
+
+    def connect(self):
+        """Open DB engine + session with connection pool."""
+        if self.session is not None:
+            return self.session
+
+        s = self.db_config[self.db_label]
+        conn_str = f"{s['driver']}://{s['user']}:{s['pwd']}@{s['addr']}:{s['port']}/{s['db_name']}"
+
+        self.engine = create_engine(
+            conn_str,
+            poolclass=QueuePool,
+            pool_size=s["pool_size"],
+            max_overflow=s["max_overflow"],
+            pool_recycle=s["pool_recycle"],
+            pool_pre_ping=True,
+            connect_args={"connect_timeout": 10},
+        )
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        self.session = SessionLocal()
+        return self.session
+
+    def disconnect(self):
+        if self.session:
+            self.session.close()
+            self.session = None
+
+    def add(self, dao_obj):
+        self.session.add(dao_obj)
+
+    def commit(self):
+        self.session.commit()
+
+    def save(self, dao_obj):
+        self.add(dao_obj)
+        self.commit()
+
+    def delete(self, dao_obj):
+        self.session.delete(dao_obj)
+        self.commit()
+===== ./app/cli_agent.py =====
+"""
+Author: Yara
+"""
+from __future__ import annotations
+import asyncio, json, os
+from typing import Any, Dict, Optional
+from google import genai
+from google.genai import types as genai_types
+from app.mcp_client import CarClient
+from app.prompts.car_agent_prompts import build_extraction_prompt, GATEKEEPER_INSTRUCTION
+from app.prompts.car_agent_texts import (
+    KEY_ORDER,
+    RESPONSE_SCHEMA,
+    PROCEED_SCHEMA,
+    QUESTIONS_MAP,
+    INTRO_HEADER,
+    INTRO_EXAMPLES,
+    EXTRA_CONSTRAINTS_PROMPT,
+)
+
+class TerminalCarAgent:
+    def __init__(self) -> None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise SystemExit("Requires environment variable GEMINI_API_KEY.")
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = "gemini-2.0-flash"  # free-tier-elegible
+
+        # Unified controler dict: None = 'haven't asked abou the filter'; ""/0 = don't apply filter; real value = apply
+        self.filters: Dict[str, Any] = {
+            "make": None, "model": None, "fuel": None, "color": None,
+            "year_min": None, "price_max": None, "mileage_max": None,
+            "is_new": None, "is_automatic": None,
+            "has_air_conditioning": None, "has_bt_radio": None,
+            "has_charger_plug": None, "is_armored": None,
+        }
+
+    def apply_extracted_filters(self, parsed: Dict[str, Any]) -> None:
+        """Applies 'response JSON' on 'unified controller dictinary', that is, get filters from response."""
+        for k, v in (parsed or {}).items():
+            if k in ("make","model","fuel","color"):
+                self.filters[k] = "" if v is None else str(v)
+            elif k in ("year_min","price_max","mileage_max"):
+                self.filters[k] = 0 if v is None else int(v)
+            elif k in ("is_new","is_automatic","has_air_conditioning","has_bt_radio",
+                       "has_charger_plug","is_armored"):
+                if v is not None:
+                    self.filters[k] = bool(v)
+
+    def relax_filters(self, runs: int) -> Dict[str, Any]:
+        """first run drop model, relaxes price and year ; second run drops car maker filter."""
+        relaxed = dict(self.filters)
+        if runs > 1:
+            relaxed["make"] = ""      # drop make e encerra
+            return relaxed
+        # runs == 1 → relax suave
+        relaxed["model"] = ""         # sem preferência de modelo
+        y = relaxed.get("year_min")
+        if isinstance(y, int) and y and y > 1980:
+            relaxed["year_min"] = max(1980, y - 3)
+        p = relaxed.get("price_max")
+        if isinstance(p, int) and p:
+            relaxed["price_max"] = int(p * 1.25)
+        return relaxed
+
+    def _current_key(self) -> Optional[str]:
+        for k in KEY_ORDER:
+            if self.filters.get(k) is None:
+                return k
+        return None
+
+    def _build_extraction_prompt(self, user_text: str) -> str:
+        return build_extraction_prompt(user_text, self._current_key())
+
+    def next_question(self) -> Optional[str]:
+        for key in KEY_ORDER:
+            if self.filters.get(key) is None:
+                return QUESTIONS_MAP[key]
+        return None
+
+    def llm_wants_to_proceed(self, latest_user_text: str) -> bool:
+        if self.next_question() is not None:
+            return False
+
+        full = f"{GATEKEEPER_INSTRUCTION}\n\nUser input:\n{latest_user_text}"
+        resp = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(full)]
+            )],
+            config=genai_types.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema=PROCEED_SCHEMA,
+            ),
+        )
+        raw = (getattr(resp, "text", None) or "")
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = raw.strip().strip('"')
+        return str(parsed).strip().upper() == "PROCEED"
+
+    def extract_and_apply(self, text: str) -> None:
+        full = self._build_extraction_prompt(text)
+        resp = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(full)]
+            )],
+            config=genai_types.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema=RESPONSE_SCHEMA,
+            ),
+        )
+        args = json.loads((getattr(resp, "text", None) or "{}"))
+        self.apply_extracted_filters(args)
+
+    async def run(self) -> None:
+        print(INTRO_HEADER)
+        print(INTRO_EXAMPLES)
+
+        q = self.next_question()
+        if q: print(q)
+
+        while True:
+            text = input("> ").strip()
+            if not text:
+                if (q := self.next_question()): print(q)
+                continue
+
+            low = text.lower()
+            if low in {"exit","quit","sair"}:
+                print("Bye."); return
+            if self.llm_wants_to_proceed(text):
+                break
+
+            self.extract_and_apply(text)
+
+            if self.next_question() is not None:
+                if self.llm_wants_to_proceed(text):
+                    break
+
+            if (q := self.next_question()):
+                print(q)
+            else:
+                break
+
+        print(EXTRA_CONSTRAINTS_PROMPT)
+        while True:
+            t = input("> ").strip()
+            if self.llm_wants_to_proceed(t):
+                break
+
+            self.extract_and_apply(t)
+
+        c = CarClient()
+        await c.initialize()
+        try:
+            rows = await self.db_query(c, self.filters)
+
+            if not rows:
+                print("No exact match. Looking for similar results...")
+                nf = self.relax_filters(runs=1)
+                rows = await self.db_query(c, nf)
+
+            if not rows or len(rows) < 3:
+                print("Querying additional similar cars...")
+                nf = self.relax_filters(runs=2)
+                more = await self.db_query(c, nf)
+                if more:
+                    rows = (rows or []) + more
+        finally:
+            await c.close()
+
+        if not rows:
+            print("Sorry, at the moment we don't have cars available that matches your search. Please try again")
+            return
+
+        print("\nResults:")
+        for i, car in enumerate(rows, 1):
+            make = car.get("make"); model = car.get("model")
+            year = car.get("year"); color = car.get("color")
+            mileage = car.get("mileage"); price = car.get("dollar_price")
+            km = f"{int(mileage):,}".replace(",", ".") if isinstance(mileage,(int,float)) else str(mileage)
+            pr = "US$ " + f"{int(price):,}".replace(",", ".") if isinstance(price,(int,float)) else str(price)
+            print(f"- {i}. {make} {model} {year}, {color}, {km} km, {pr}")
+
+        print("\nType 'new' to start another search or 'exit' to quit.")
+        if input("> ").strip().lower() in {"new","again","y","yes"}:
+            self.__init__(); await self.run()
+
+    async def db_query(self, c: CarClient, query_filters: Dict[str, Any], limit: int = 50):
+        """
+        Consulta o MCP/DB com os filtros fornecidos e fecha o cliente corretamente.
+        nf: dict com make, fuel, year_min, price_max
+        """
+        return await c.search_cars(
+            make=query_filters.get("make"),
+            fuel=query_filters.get("fuel"),
+            year_min=query_filters.get("year_min"),
+            price_max=query_filters.get("price_max"),
+            limit=limit,
+        )
+
+if __name__ == "__main__":
+    asyncio.run(TerminalCarAgent().run())
+===== ./app/dao/__init__.py =====
+# Author: Yara
+===== ./app/dao/car_market.py =====
+import sqlalchemy
+from sqlalchemy.orm import declarative_base
+
+Base = declarative_base()
+
+class DAOCar(Base):
+    __tablename__ = "car_market"
+
+    id = sqlalchemy.Column(sqlalchemy.Integer, primary_key=True, autoincrement=True)
+    make = sqlalchemy.Column(sqlalchemy.String(25), nullable=False)
+    model = sqlalchemy.Column(sqlalchemy.String(45), nullable=False)
+    year = sqlalchemy.Column(sqlalchemy.SmallInteger, nullable=False)
+    color = sqlalchemy.Column(sqlalchemy.String(25), nullable=False)
+    fuel = sqlalchemy.Column(sqlalchemy.Enum("gasoline", "flex", "diesel", "electric", "hybrid", name="fuel_enum"), nullable=False)
+    mileage = sqlalchemy.Column(sqlalchemy.Integer, nullable=False)
+    dollar_price = sqlalchemy.Column(sqlalchemy.Integer, nullable=False)
+    is_new = sqlalchemy.Column(sqlalchemy.Boolean, default=False)
+    is_automatic = sqlalchemy.Column(sqlalchemy.Boolean, default=False)
+    has_air_conditioning = sqlalchemy.Column(sqlalchemy.Boolean, default=False)
+    has_charger_plug = sqlalchemy.Column(sqlalchemy.Boolean, default=False)
+    is_armored = sqlalchemy.Column(sqlalchemy.Boolean, default=False)
+    has_bt_radio = sqlalchemy.Column(sqlalchemy.Boolean, default=False)
+===== ./app/services/__init__.py =====
+# Author Yara
+===== ./app/services/seed_db.py =====
+import random
+import time
+import traceback
+from app.dao.car_market import DAOCar
+from app.db_utils.db_connection import DBConn
+from app.services.makers_and_models import MAKERS_AND_MODELS
+from datetime import date
+
+
+COLORS = ["black","white","silver","gray","red","blue","green","yellow","orange","brown"]
+FUEL_ENUM = ['gasoline','flex','diesel','electric','hybrid']
+
+
+class DBSeeder:
+
+    def __init__(self, seed_count: int=1000):
+        self.seed_count = seed_count
+
+    def run(self):
+        time.sleep(12)
+        for i in range(6): # had too many issues in auto-start seeder
+            try:
+                self.create_db_conn()
+                self.add_random_data()
+                self.db_conn.commit()
+                time.sleep(2)
+                break
+            except Exception as e:
+                print(f'failed seed script. debug and try again. {e}')
+                traceback.print_exc()
+            finally:
+                self.db_conn.disconnect()
+
+    def create_db_conn(self):
+        self.db_conn = DBConn()
+        self.db_conn.connect()
+
+    def add_random_data(self):
+        makes = list(MAKERS_AND_MODELS.keys())
+        for i in range(self.seed_count):
+            make = random.choice(makes)
+            year = random.randint(1980,2025)
+            dao = DAOCar()
+            dao.make = make
+            dao.model = random.choice(MAKERS_AND_MODELS[make])
+            dao.year = year
+            dao.color = random.choice(COLORS)
+            dao.fuel = random.choice(FUEL_ENUM)
+            dao.mileage = self.mileage_considering_year(year)
+            # Keeping random for test purposes. For more realistic prices, a function considering attributes could be applied 
+            dao.dollar_price = random.randint(4000, 120000)
+            dao.is_new = random.choice([True, False])
+            dao.is_automatic = random.choice([True, False])
+            dao.has_air_conditioning = random.choice([True, False])
+            dao.has_charger_plug = random.choice([True, False])
+            dao.is_armored = random.choice([True, False])
+            dao.has_bt_radio = random.choice([True, False])
+            
+            self.db_conn.add(dao)
+
+    @staticmethod
+    def mileage_considering_year(car_fabrication_year:int) -> int:
+        current_year = date.today().year
+        car_age = current_year - car_fabrication_year
+        car_age = max(0, car_age) # car age never below zero
+        min_mileage = 12000 * car_age # in miles, estimate found with google search
+        max_mileage = 15000 * car_age
+       
+        return random.randint(min_mileage, max_mileage)
+
+
+
+if __name__ == "__main__":
+    DBSeeder().run()
+===== ./app/services/makers_and_models.py =====
+MAKERS_AND_MODELS = {
+    "Audi": ["A3", "A4", "A6", "Q3", "Q5", "e-tron"],
+    "Bentley": ["Continental GT", "Bentayga", "Flying Spur"],
+    "BMW": ["1 Series", "3 Series", "5 Series", "X3", "X5", "i3"],
+    "Bugatti": ["Veyron", "Chiron", "Divo"],
+    "Cadillac": ["ATS", "CTS", "Escalade", "XT5"],
+    "Chevrolet": ["Onix", "Cruze", "Camaro", "S10", "Silverado"],
+    "Chrysler": ["300", "Pacifica", "Voyager"],
+    "Citroën": ["C3", "C4 Cactus", "C5 Aircross"],
+    "Dodge": ["Charger", "Challenger", "Durango"],
+    "Ferrari": ["F8 Tributo", "812 Superfast", "Roma", "SF90"],
+    "Fiat": ["500", "Panda", "Tipo", "Toro", "Argo"],
+    "Ford": ["Fiesta", "Focus", "Mustang", "Ranger", "Explorer", "F-150"],
+    "Honda": ["Civic", "Accord", "Fit", "HR-V", "CR-V"],
+    "Hummer": ["H2", "H3", "Hummer EV"],
+    "Hyundai": ["HB20", "Elantra", "Sonata", "Tucson", "Creta", "i30"],
+    "Jaguar": ["XE", "XF", "F-Pace", "E-Pace", "F-Type", "I-Pace"],
+    "Jeep": ["Renegade", "Compass", "Wrangler", "Grand Cherokee", "Gladiator"],
+    "Kia": ["Rio", "Forte", "Soul", "Sportage", "Sorento", "Seltos"],
+    "Lamborghini": ["Huracán", "Aventador", "Urus"],
+    "Land Rover": ["Defender", "Discovery", "Range Rover Evoque", "Range Rover Sport"],
+    "Lexus": ["IS", "ES", "NX", "RX", "UX"],
+    "Maserati": ["Ghibli", "Quattroporte", "Levante", "Grecale", "MC20"],
+    "McLaren": ["570S", "650S", "720S", "GT", "Artura"],
+    "Mercedes-Benz": ["A-Class", "C-Class", "E-Class", "S-Class", "GLA", "GLC", "GLE"],
+    "Mini": ["Cooper", "Countryman", "Clubman"],
+    "Mitsubishi": ["Lancer", "Outlander", "ASX", "Pajero", "Eclipse Cross"],
+    "Nissan": ["March", "Versa", "Sentra", "Kicks", "Qashqai", "Rogue"],
+    "Opel": ["Corsa", "Astra", "Insignia", "Mokka"],
+    "Peugeot": ["208", "2008", "308", "3008", "5008"],
+    "Porsche": ["911", "Cayenne", "Macan", "Panamera", "Taycan", "718"],
+    "Renault": ["Clio", "Sandero", "Logan", "Duster", "Captur", "Mégane"],
+    "Rolls-Royce": ["Phantom", "Ghost", "Wraith", "Cullinan", "Dawn"],
+    "Rover": ["75", "45", "25"],
+    "Subaru": ["Impreza", "Legacy", "Forester", "Outback", "XV", "WRX"],
+    "Suzuki": ["Swift", "Baleno", "Vitara", "Jimny", "S-Cross"],
+    "Tesla": ["Model S", "Model 3", "Model X", "Model Y", "Cybertruck"],
+    "Toyota": ["Yaris", "Corolla", "Camry", "Prius", "RAV4", "Hilux"],
+    "Volkswagen": ["Polo", "Golf", "Passat", "Tiguan", "T-Cross", "Jetta"],
+    "Volvo": ["S60", "S90", "V60", "XC40", "XC60", "XC90"]
+}
+===== ./app/sql/__init__.py =====
+# Author Yara
+===== ./app/sql/db_setup_script.sql =====
+-- ================================================== --
+-- First step: granting privileges so app can freely querry in DB
+-- ================================================== --
+
+CREATE DATABASE IF NOT EXISTS `cars`
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+USE `cars`;
+
+CREATE USER IF NOT EXISTS 'car_db_user'@'%' IDENTIFIED WITH mysql_native_password BY 'car_db_pass';
+GRANT ALL PRIVILEGES ON `cars`.* TO 'car_db_user'@'%';
+FLUSH PRIVILEGES; 
+
+-- ================================================== --
+-- tables
+-- ================================================== --
+
+CREATE TABLE car_market  (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    make VARCHAR(25) NOT NULL,
+    model VARCHAR(45) NOT NULL,
+    year SMALLINT UNSIGNED NOT NULL CHECK (year BETWEEN 1900 AND 2100),
+    color VARCHAR(25) NOT NULL,
+    fuel ENUM('gasoline','flex','diesel','electric','hybrid') NOT NULL,
+    mileage INT UNSIGNED NOT NULL,
+    dollar_price INT NOT NULL CHECK (dollar_price BETWEEN 1000 AND 100000000), -- up to here are the test required response attributes (not null)
+    is_new BOOL,
+    is_automatic BOOL,
+    has_air_conditioning BOOL,
+    has_charger_plug BOOL,
+    is_armored BOOL,
+    has_bt_radio BOOL
+);
+===== ./app/mcp_server.py =====
+"""
+Simple server MCP with FastMCP
+References:
+- Quickstart MCP (concepts and STDIO): https://modelcontextprotocol.io/quickstart/server
+- FastMCP (decorator @mcp.tool; tools sync/async): https://gofastmcp.com/getting-started/quickstart
+- Docs of MCP tools https://gofastmcp.com/servers/tools
+
+Used sync functions to keep it simple (first time coding MCP)
+
+Author: Yara
+Created on: September 2025
+"""
+
+from typing import Optional, List, Dict, Any
+from sqlalchemy import func, and_
+from fastmcp import FastMCP
+
+from app.db_utils.db_connection import DBConn
+from app.dao.car_market import DAOCar
+
+mcp = FastMCP("mcp-server")
+
+
+@mcp.tool(
+    name="search_cars",
+    description=(
+        "Query cars DB with optional filters. "
+        "Returns a list of dicts with: make, model, year, color, mileage, dollar_price and flags."
+    ),
+)
+def search_cars(
+    make: Optional[str] = None,
+    year_min: Optional[int] = None,
+    year_max: Optional[int] = None,
+    fuel: Optional[str] = None,
+    price_min: Optional[int] = None,
+    price_max: Optional[int] = None,
+    limit: Optional[int] = 20,
+) -> List[Dict[str, Any]]:
+    """
+    MCP tool. Receives filters, queries the DB and returns results.
+    """
+    session = DBConn().connect()
+    q = session.query(DAOCar)
+
+    # Case-insensitive equals (robusto com ENUM no MySQL)
+    if make:
+        q = q.filter(func.lower(DAOCar.make) == make.lower())
+    if year_min is not None:
+        q = q.filter(DAOCar.year >= year_min)
+    if year_max is not None:
+        q = q.filter(DAOCar.year <= year_max)
+    if fuel:
+        q = q.filter(func.lower(DAOCar.fuel) == fuel.lower())
+    if price_min is not None:
+        q = q.filter(DAOCar.dollar_price >= price_min)
+    if price_max is not None:
+        q = q.filter(DAOCar.dollar_price <= price_max)
+
+    # Limite razoável
+    if not limit or limit <= 0 or limit > 100:
+        limit = 20
+
+    rows = q.limit(limit).all()
+
+    def to_dict(obj: DAOCar) -> Dict[str, Any]:
+        return {
+            "id": getattr(obj, "id", None),  # útil em dev, não precisa exibir ao usuário final
+            "make": getattr(obj, "make", None),
+            "model": getattr(obj, "model", None),
+            "year": getattr(obj, "year", None),
+            "color": getattr(obj, "color", None),
+            "fuel": getattr(obj, "fuel", None),
+            "mileage": getattr(obj, "mileage", None),
+            "dollar_price": getattr(obj, "dollar_price", None),
+            "is_new": getattr(obj, "is_new", None),
+            "is_automatic": getattr(obj, "is_automatic", None),
+            "has_air_conditioning": getattr(obj, "has_air_conditioning", None),
+            "has_charger_plug": getattr(obj, "has_charger_plug", None),
+            "is_armored": getattr(obj, "is_armored", None),
+            "has_bt_radio": getattr(obj, "has_bt_radio", None),
+        }
+
+    return [to_dict(r) for r in rows]
+
+
+if __name__ == "__main__":
+    mcp.run()
+===== ./requirements.txt =====
+SQLAlchemy==2.0.32
+PyMySQL==1.1.1
+fastmcp==2.12.0
+mcp==1.13.1
+google-genai==0.3.0
+===== ./start.sh =====
+#!/usr/bin/env bash
+docker-compose up -d --build
+sleep 4
+docker-compose exec dev python -m app.cli_agent
+===== ./repo_dump.txt =====
+===== ./README.md =====
+# my-dreamcar
+Chat agent helps you find the best car for you
+
+(MCP + Gemini)
+
+This project delivers a terminal-based “virtual agent” that interacts with user to find cars in the database.
+It uses a minimal MCP server for search and a lightweight LLM step (Gemini) only to extract filters from user responses and to decides if more questions will be asked or if user wants to run query or if user wants to stop conversation.
+The goal is to keep the code straight to the point, readable, and close to real-world ready-solution (import/apply solutions, not reinvent).
+
+## Setup
+
+Tested on: Docker 27.5.1 and Docker Compose v2.22.0
+
+- Clone this repo into your machine
+- Copy the environment template and set your key:
+   ```cp .env.example .env```
+   edit .env and set: GEMINI_API_KEY= (see below how to get free api keys)...  
+
+  
+- Build application:
+   ```sudo docker-compose up --build -d``` **
+- Go to container terminal:
+  ```sudo docker-compose exec dev bash``` **
+- Finally, start agent:
+  ```python -m app.cli_agent```
+
+**docker compose without hifen for some users
+
+## Environment Variables
+
+- GEMINI_API_KEY     # required by the terminal agent (keep it OUT of version control)
+- db-related: hardcoded for testing purposes (no real data/security issue). In real-case scenario, set credentials in .env file (as exampled in env.example). If you set variables in .env, they will automatically fill docker-compose and be used in project.
+
+## Examples (free-form conversation).
+Be ware: unrealistis data seeded with few examples (n=100) as requested by the challenge. Results may be lacking or unrealistic (car model that doesn't have electric battery being show as electric).
+
+- I want a new Honda
+- I want an electric car with mileage smaller then 90k
+- Any brand, flex and automatic
+
+### Seed Data (challenge step)
+
+The DB is auto-seeded so the demo works right away. Since the ammount of seeded data was very short (100 cars of several brands), app query results were constantly returning empty. So the ammount of seeded data has been raised to 1000 in order to better test the app. 
+
+### How to obtain a free Gemini API key (easy and quick)
+
+1) Open Google AI Studio in your browser: https://aistudio.google.com/app/apikey
+2) Click “Get API key” and follow the prompts to create a key in your Google account.
+3) Copy the key and addo to your .env
+
+## Troubleshooting
+
+• “Requires environment variable GEMINI_API_KEY.” — add to your .env or set in container's terminal.
+• No results — try a broader query (agent will also relax filters automatically and show similar results).
+
+
+## Notes for reviewers
+
+• The code mirrors reference-style code and vendor glue to avoid “AI-generated code”, and to respect guidelines of using ready solution without the need of unnecessary and complex code.
+• All query filters are optional; output fields (as specified by challenge): brand, model, year, color, mileage, price.
+===== ./.env =====
+GEMINI_API_KEY=AIzaSyBeRr4pvVB-KD-htEDTKuXJvWuUhhOPkrE
+
+DB_HOST=db
+DB_PORT=3306
+
+MYSQL_ROOT_PASSWORD=rootpass
+MYSQL_DATABASE=cars
+MYSQL_USER=car_user
+MYSQL_PASSWORD=car_pass
+===== ./.gitignore =====
+__pycache__/
+readme.md
+===== ./Dockerfile =====
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PYTHONPATH=/app
+
+
