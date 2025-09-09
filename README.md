@@ -38,7 +38,7 @@ Be ware: unrealistis data seeded with few examples (n=100) as requested by the c
 
 ### Seed Data (challenge step)
 
-The DB is auto-seeded so the demo works right away.
+The DB is auto-seeded so the demo works right away. Since the ammount of seeded data was very short (100 cars of several brands), app query results were constantly returning empty. So the ammount of seeded data has been raised to 1000 in order to better test the app. 
 
 ### How to obtain a free Gemini API key (easy and quick)
 
@@ -52,7 +52,7 @@ The DB is auto-seeded so the demo works right away.
 • No results — try a broader query (agent will also relax filters automatically and show similar results).
 
 
-Notes for reviewers
+## Notes for reviewers
 
 • The code mirrors reference-style code and vendor glue to avoid “AI-generated code”, and to respect guidelines of using ready solution without the need of unnecessary and complex code.
 • All query filters are optional; output fields (as specified by challenge): brand, model, year, color, mileage, price.
