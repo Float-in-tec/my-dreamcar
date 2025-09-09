@@ -18,11 +18,13 @@ Tested on: Docker 27.5.1 and Docker Compose v2.22.0
 
   
 - Build application:
-   ```sudo docker-compose up --build -d``` *docker compose no hifen for some users
-- Start agent:
-  ```sudo docker-compose exec dev bash```
-  and on container's terminal:
+   ```sudo docker-compose up --build -d``` **
+- Go to container terminal:
+  ```sudo docker-compose exec dev bash``` **
+- Finally, start agent:
   ```python -m app.cli_agent```
+
+**docker compose without hifen for some users
 
 ## Environment Variables
 
