@@ -27,7 +27,7 @@ Tested on: Docker 27.5.1 and Docker Compose v2.22.0
 ## Environment Variables
 
 - GEMINI_API_KEY     # required by the terminal agent (keep it OUT of version control)
-- db-related: hardcoded for testing purposes (no real data/security issue). In real-case scenario, set credentials in .env file (as exampled in env.example)
+- db-related: hardcoded for testing purposes (no real data/security issue). In real-case scenario, set credentials in .env file (as exampled in env.example). If you set variables in .env, they will automatically fill docker-compose and be used in project.
 
 ## Examples (free-form conversation).
 Be ware: unrealistis data seeded with few examples (n=100) as requested by the challenge. Results may be lacking or unrealistic (car model that doesn't have electric battery being show as electric).
