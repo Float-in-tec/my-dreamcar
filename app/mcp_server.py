@@ -43,21 +43,15 @@ def search_cars(
     session = DBConn().connect()
     q = session.query(DAOCar)
 
-    # Case-insensitive equals (robusto com ENUM no MySQL)
     if make:
         q = q.filter(func.lower(DAOCar.make) == make.lower())
     if year_min is not None:
         q = q.filter(DAOCar.year >= year_min)
-    if year_max is not None:
-        q = q.filter(DAOCar.year <= year_max)
     if fuel:
         q = q.filter(func.lower(DAOCar.fuel) == fuel.lower())
-    if price_min is not None:
-        q = q.filter(DAOCar.dollar_price >= price_min)
-    if price_max is not None:
+    if price_max is not None and price_max > 0:
         q = q.filter(DAOCar.dollar_price <= price_max)
 
-    # Limite razoável
     if not limit or limit <= 0 or limit > 100:
         limit = 20
 
@@ -65,7 +59,7 @@ def search_cars(
 
     def to_dict(obj: DAOCar) -> Dict[str, Any]:
         return {
-            "id": getattr(obj, "id", None),  # útil em dev, não precisa exibir ao usuário final
+            "id": getattr(obj, "id", None),
             "make": getattr(obj, "make", None),
             "model": getattr(obj, "model", None),
             "year": getattr(obj, "year", None),

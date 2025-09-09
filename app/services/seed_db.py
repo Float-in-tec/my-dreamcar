@@ -13,7 +13,7 @@ FUEL_ENUM = ['gasoline','flex','diesel','electric','hybrid']
 
 class DBSeeder:
 
-    def __init__(self, seed_count: int=100):
+    def __init__(self, seed_count: int=1000):
         self.seed_count = seed_count
 
     def run(self):
@@ -71,4 +71,4 @@ class DBSeeder:
 
 
 if __name__ == "__main__":
-    DBSeeder(seed_count=100).run()
+    DBSeeder().run()
